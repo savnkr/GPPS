@@ -1,0 +1,53 @@
+heat_equation:
+  pde:
+    alpha: 0.01
+    L_x: 1.0
+    L_t: 1.0
+
+  kernel:
+    lengthscale: 0.6
+    variance: 0.02
+
+  training:
+    n_initial: 20
+    n_final: 60
+    n_iterations: 8
+    n_test_grid: 20
+    n_pool: 1000
+    jitter: 1.0e-6
+
+  active_learning:
+    acquisition_function: variance
+    kappa: 2.0
+    exclusion_radius: 0.05
+    ar_ratio: 0.3
+
+  output:
+    save_results: true
+    results_dir: results/heat_equation
+
+
+poisson_2d:
+  kernel:
+    lengthscale: 2.5
+    variance: 0.25
+
+  training:
+    n_initial: 10
+    n_final: 80
+    n_iterations: 10
+    n_test: 600
+    n_boundary: 30
+    n_pool: 2000
+    jitter: 1.0e-6
+
+  active_learning:
+    acquisition_function: variance
+    kappa: 2.0
+    exclusion_radius: 0.05
+    ar_ratio: 0.3
+    use_clustering: true
+
+  output:
+    save_results: true
+    results_dir: results/poisson_2d

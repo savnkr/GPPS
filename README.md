@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.png" width="300" alt="Logo" />
+  <img src="logo.png" width="300" alt="Logo" />
 </p>
 
 # Scalable h-adaptive probabilistic solver for time-independent and time-dependent systems
@@ -15,7 +15,7 @@ The code implements a scalable **Gaussian process probabilistic numerical solver
 
 **Case Study 2: Poisson equation in 3D domain**
 
-![fig](assets/image.png)
+![fig](image.png)
 
 ---
 ## Usage

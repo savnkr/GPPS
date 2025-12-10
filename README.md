@@ -15,7 +15,7 @@ The code implements a scalable **Gaussian process probabilistic numerical solver
 
 **Case Study 2: Poisson equation in 3D domain**
 
-![fig](image.png)
+![fig](image.PNG)
 
 ---
 ## Usage

@@ -16,3 +16,4 @@
 *.pt
 results/
 figures/
+*.csv

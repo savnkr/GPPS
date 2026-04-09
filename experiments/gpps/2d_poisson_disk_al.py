@@ -1,8 +1,8 @@
 #%%
-"""
+r"""
 Active Learning for 2D Poisson Equation on Unit Disk
 PDE: \Delta u = -1 with u = 0 on boundary
-Exact solution: u(x,y) = (1 - x² - y²) / 4
+Exact solution: u(x,y) = (1 - x^2 - y^2) / 4
 """
 import sys
 from pathlib import Path
@@ -13,6 +13,9 @@ sys.path.insert(0, str(ROOT_DIR))
 import torch
 import numpy as np
 import yaml
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 from src import (
     RBFKernel, PoissonOperators, GPPoissonSolver,
@@ -77,14 +80,87 @@ def run_active_learning(solver, Xi, Xb, g_Xb, X_pool, X_test, u_ref, cfg, device
                 Xi_active = torch.cat([Xi_active, new_pts], dim=0)
                 n_points.append(Xi_active.shape[0])
     
+    pred_std = np.sqrt(np.clip(pred_var, 1e-12, None))
     return {
-        'points': n_points, 
-        'errors': errors, 
-        'variances': variances, 
-        'Xi_final': Xi_active, 
-        'pred_mean': pred_mean,
-        'pred_var': pred_var
+        'points': n_points, 'errors': errors, 'variances': variances,
+        'Xi_final': Xi_active, 'pred_mean': pred_mean, 'pred_std': pred_std
     }
+
+
+def plot_results(clustered, nocluster, X_test, u_ref, Xb, output_dir):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    plt.rcParams.update({
+        'font.size': 12, 'axes.labelsize': 14, 'axes.titlesize': 16,
+        'figure.dpi': 300, 'savefig.dpi': 600, 'savefig.bbox': 'tight',
+    })
+
+    X_np = X_test.cpu().numpy()
+    x1, x2 = X_np[:, 0], X_np[:, 1]
+    theta = np.linspace(0, 2 * np.pi, 100)
+    circle_x, circle_y = np.cos(theta), np.sin(theta)
+
+    pred_cl = clustered['pred_mean'].cpu().numpy().reshape(-1)
+    error_cl = np.abs(pred_cl - u_ref)
+    std_cl = clustered['pred_std'].reshape(-1)
+
+    # Row plot: Ground Truth | Mean Prediction | Absolute Error | Std Dev
+    fig, axes = plt.subplots(1, 4, figsize=(20, 4.5))
+
+    im0 = axes[0].tricontourf(x1, x2, u_ref, levels=50, cmap='viridis')
+    fig.colorbar(im0, ax=axes[0], shrink=0.8)
+    axes[0].plot(circle_x, circle_y, 'k--', alpha=0.5, linewidth=0.8)
+    axes[0].set_title('Ground Truth')
+    axes[0].set_xlabel('$x_1$'); axes[0].set_ylabel('$x_2$')
+    axes[0].set_aspect('equal')
+
+    im1 = axes[1].tricontourf(x1, x2, pred_cl, levels=50, cmap='viridis')
+    fig.colorbar(im1, ax=axes[1], shrink=0.8)
+    Xi_cl = clustered['Xi_final'].cpu().numpy()
+    axes[1].scatter(Xi_cl[:, 0], Xi_cl[:, 1], c='white', s=6, alpha=0.7, edgecolors='black', linewidth=0.3, zorder=5)
+    axes[1].plot(circle_x, circle_y, 'k--', alpha=0.5, linewidth=0.8)
+    axes[1].set_title(f'Mean Prediction (MAE: {clustered["errors"][-1]:.5f})')
+    axes[1].set_xlabel('$x_1$')
+    axes[1].set_aspect('equal')
+
+    im2 = axes[2].tricontourf(x1, x2, error_cl, levels=50, cmap='coolwarm')
+    fig.colorbar(im2, ax=axes[2], shrink=0.8)
+    axes[2].plot(circle_x, circle_y, 'k--', alpha=0.5, linewidth=0.8)
+    axes[2].set_title('Absolute Error')
+    axes[2].set_xlabel('$x_1$')
+    axes[2].set_aspect('equal')
+
+    im3 = axes[3].tricontourf(x1, x2, std_cl, levels=50, cmap='plasma')
+    fig.colorbar(im3, ax=axes[3], shrink=0.8)
+    axes[3].plot(circle_x, circle_y, 'k--', alpha=0.5, linewidth=0.8)
+    axes[3].set_title('Standard Deviation')
+    axes[3].set_xlabel('$x_1$')
+    axes[3].set_aspect('equal')
+
+    plt.tight_layout()
+    fig.savefig(output_dir / 'row_al_cluster_poisson_2d.pdf', format='pdf', bbox_inches='tight')
+    fig.savefig(output_dir / 'row_al_cluster_poisson_2d.png', format='png', dpi=600, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Saved row plot to {output_dir}/row_al_cluster_poisson_2d.[pdf|png]")
+
+    # Convergence plot
+    fig2, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+    ax1.plot(clustered['points'], clustered['errors'], 'o-', color='#2ca02c', linewidth=2, label='AL + Clustering')
+    ax1.plot(nocluster['points'], nocluster['errors'], 's--', color='#1f77b4', linewidth=2, label='AL (no clustering)')
+    ax1.set_xlabel('Number of Training Points'); ax1.set_ylabel('Mean Absolute Error')
+    ax1.set_title('Error Convergence'); ax1.legend(); ax1.grid(True, alpha=0.3)
+
+    ax2.plot(clustered['points'], clustered['variances'], 'o-', color='#2ca02c', linewidth=2, label='AL + Clustering')
+    ax2.plot(nocluster['points'], nocluster['variances'], 's--', color='#1f77b4', linewidth=2, label='AL (no clustering)')
+    ax2.set_xlabel('Number of Training Points'); ax2.set_ylabel('Mean Posterior Variance')
+    ax2.set_title('Uncertainty Reduction'); ax2.legend(); ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    fig2.savefig(output_dir / 'convergence_poisson_2d.pdf', format='pdf', bbox_inches='tight')
+    fig2.savefig(output_dir / 'convergence_poisson_2d.png', format='png', dpi=600, bbox_inches='tight')
+    plt.close(fig2)
+    print(f"Saved convergence plot to {output_dir}/convergence_poisson_2d.[pdf|png]")
 
 
 def save_results(results, X_test, u_ref, output_dir):
@@ -98,13 +174,13 @@ def save_results(results, X_test, u_ref, output_dir):
         clustered_variances=results['clustered']['variances'],
         clustered_Xi=results['clustered']['Xi_final'].cpu().numpy(),
         clustered_pred=results['clustered']['pred_mean'].cpu().numpy(),
-        clustered_var=results['clustered']['pred_var'],
+        clustered_var=results['clustered']['pred_std']**2,
         nocluster_points=results['nocluster']['points'],
         nocluster_errors=results['nocluster']['errors'],
         nocluster_variances=results['nocluster']['variances'],
         nocluster_Xi=results['nocluster']['Xi_final'].cpu().numpy(),
         nocluster_pred=results['nocluster']['pred_mean'].cpu().numpy(),
-        nocluster_var=results['nocluster']['pred_var'],
+        nocluster_var=results['nocluster']['pred_std']**2,
         X_test=X_test.cpu().numpy(),
         u_ref=u_ref
     )
@@ -119,23 +195,17 @@ def main():
     
     print(f"Using device: {device}")
     
-    # Setup boundary points
     theta_b = torch.linspace(0, 2 * torch.pi, cfg['training']['n_boundary'] + 1)[:-1]
     Xb = torch.stack([torch.cos(theta_b), torch.sin(theta_b)], dim=1).to(dtype).to(device)
     g_Xb = torch.zeros(cfg['training']['n_boundary'], 1, dtype=dtype, device=device)
     
-    # Test points
     Xi_test, _, _, _ = generate_disc_domain(n_interior=cfg['training']['n_test'], n_boundary=0, dtype=dtype, device=device)
     X_test = torch.cat((Xi_test, Xb), dim=0)
     u_ref = exact_solution(X_test.cpu())
     
-    # Candidate pool
     X_pool = sobol_disk_sampling(cfg['training']['n_pool'], seed=123, dtype=dtype, device=device)
-    
-    # Initial points (same for both methods)
     Xi_initial = sobol_disk_sampling(cfg['training']['n_initial'], dtype=dtype, device=device)
     
-    # Setup GP solver
     kernel = RBFKernel(
         lengthscale=cfg['kernel']['lengthscale'],
         variance=cfg['kernel']['variance'],
@@ -144,19 +214,16 @@ def main():
     operators = PoissonOperators(kernel)
     solver = GPPoissonSolver(kernel, operators)
     
-    # Run with clustering
     print("\n=== Active Learning WITH Clustering ===")
     clustered_results = run_active_learning(
         solver, Xi_initial.clone(), Xb, g_Xb, X_pool, X_test, u_ref, cfg, device, use_clustering=True
     )
     
-    # Run without clustering
     print("\n=== Active Learning WITHOUT Clustering ===")
     nocluster_results = run_active_learning(
         solver, Xi_initial.clone(), Xb, g_Xb, X_pool, X_test, u_ref, cfg, device, use_clustering=False
     )
     
-    # Summary
     print("\n=== Results Summary ===")
     print(f"With Clustering:    MAE={clustered_results['errors'][-1]:.6f}, Var={clustered_results['variances'][-1]:.6f}")
     print(f"Without Clustering: MAE={nocluster_results['errors'][-1]:.6f}, Var={nocluster_results['variances'][-1]:.6f}")
@@ -165,13 +232,13 @@ def main():
         improvement = 100 * (nocluster_results['errors'][-1] - clustered_results['errors'][-1]) / nocluster_results['errors'][-1]
         print(f"Improvement with clustering: {improvement:.2f}%")
     
-    # Save results
+    output_dir = ROOT_DIR / cfg['output']['results_dir']
+    
     if cfg['output']['save_results']:
-        results = {
-            'clustered': clustered_results,
-            'nocluster': nocluster_results
-        }
-        save_results(results, X_test, u_ref, ROOT_DIR / cfg['output']['results_dir'])
+        results = {'clustered': clustered_results, 'nocluster': nocluster_results}
+        save_results(results, X_test, u_ref, output_dir)
+    
+    plot_results(clustered_results, nocluster_results, X_test, u_ref, Xb, output_dir)
 
 
 if __name__ == "__main__":

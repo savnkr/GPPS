@@ -3,12 +3,12 @@ import torch.nn as nn
 
 
 class PoissonOperators(nn.Module):
-    """Operators for Poisson equation: ∇²u = f (Laplacian)"""
+    """Operators for Poisson equation: ∇²u = f (Laplacian), dimension-agnostic."""
     def __init__(self, kernel):
         super().__init__()
         self.kernel = kernel
         self._setup_operators()
-        
+
     def _setup_operators(self):
         self.hess_diag_fnx2 = lambda x1, x2: torch.diag(torch.func.hessian(self.kernel, argnums=1)(x1, x2))
         self.grad_fnx2 = lambda x1, x2: torch.vmap(torch.vmap(torch.func.grad(self.kernel, argnums=1), in_dims=(0, 0)), in_dims=(0, 0))(x1, x2)
@@ -25,7 +25,7 @@ class PoissonOperators(nn.Module):
         X1_expand = X1.unsqueeze(1).repeat(1, Xb.size(0), 1)
         Xb_expand = Xb.unsqueeze(0).repeat(X1.size(0), 1, 1)
         hessian_K_x1 = self.hess_fnx1(X1_expand, Xb_expand)
-        return (hessian_K_x1[:, :, 0] + hessian_K_x1[:, :, 1]).detach()
+        return hessian_K_x1.sum(dim=-1).detach()
 
     def apply_boundary_operator(self, X1, Xb):
         X1_expand = X1.unsqueeze(1).repeat(1, Xb.size(0), 1)
@@ -34,12 +34,12 @@ class PoissonOperators(nn.Module):
 
     def operator_lx2(self, X1, X2):
         hessian_K_x2 = self.hess_fnx2(X1, X2)
-        return hessian_K_x2[:, :, 0] + hessian_K_x2[:, :, 1]
+        return hessian_K_x2.sum(dim=-1)
 
     def _operator_lx1lx2(self, X1, X2):
         hess_diag_lx1lx2 = lambda x1, x2: torch.diag(torch.func.hessian(self._hess_funcx2, argnums=0)(x1, x2))
         hess = torch.vmap(torch.vmap(hess_diag_lx1lx2, in_dims=(0, 0)), in_dims=(0, 0))(X1, X2)
-        return hess[:, :, 0] + hess[:, :, 1]
+        return hess.sum(dim=-1)
 
     def _hess_funcx2(self, X1, X2):
         hess_op = self.hess_diag_fnx2(X1, X2)

@@ -51,3 +51,31 @@ poisson_2d:
   output:
     save_results: true
     results_dir: results/poisson_2d
+
+
+poisson_3d:
+  kernel:
+    lengthscale: 0.531
+    variance: 0.678
+
+  training:
+    n_interior_per_side: 6
+    n_boundary_per_side: 8
+    n_initial: 20
+    n_final: 80
+    n_iterations: 10
+    n_test: 500
+    n_pool: 2000
+    jitter: 1.0e-6
+
+  active_learning:
+    acquisition_function: variance
+    kappa: 2.0
+    exclusion_radius: 0.05
+    ar_ratio: 0.3
+    use_clustering: true
+    na_per_iter: 5
+
+  output:
+    save_results: true
+    results_dir: results/poisson_3d

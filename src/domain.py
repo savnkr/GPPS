@@ -50,12 +50,71 @@ def generate_disc_domain(n_interior=100, n_boundary=50, r_interior=0.98, seed=No
             f_Xi.to(dtype).to(device), g_Xb.to(dtype).to(device))
 
 
+def generate_cuboid_domain(n_interior_per_side=6, n_boundary_per_side=8, dtype=torch.float64, device=None):
+    device = device or torch.device('cpu')
+
+    x = torch.linspace(0, 1, n_interior_per_side)
+    X, Y, Z = torch.meshgrid(x, x, x, indexing='ij')
+    points = torch.stack([X.flatten(), Y.flatten(), Z.flatten()], dim=1)
+
+    boundary_mask = (
+        (points[:, 0] == 0) | (points[:, 0] == 1) |
+        (points[:, 1] == 0) | (points[:, 1] == 1) |
+        (points[:, 2] == 0) | (points[:, 2] == 1)
+    )
+    Xi = points[~boundary_mask]
+
+    Xb = generate_cuboid_boundary(n_boundary_per_side, dtype=dtype, device=device)
+
+    f_Xi = (-3 * (np.pi ** 2) *
+            torch.sin(np.pi * Xi[:, 0]) *
+            torch.sin(np.pi * Xi[:, 1]) *
+            torch.sin(np.pi * Xi[:, 2])).reshape(-1, 1)
+
+    g_Xb = torch.zeros(Xb.shape[0], 1)
+
+    return (Xi.to(dtype).to(device), Xb.to(dtype).to(device),
+            f_Xi.to(dtype).to(device), g_Xb.to(dtype).to(device))
+
+
+def generate_cuboid_boundary(n_per_edge=8, dtype=torch.float64, device=None):
+    device = device or torch.device('cpu')
+    pts = []
+    edge = np.linspace(0, 1, n_per_edge)
+
+    for val in [0, 1]:
+        for y in edge:
+            for z in edge:
+                pts.append([val, y, z])
+
+    for val in [0, 1]:
+        for x in edge[1:-1]:
+            for z in edge:
+                pts.append([x, val, z])
+
+    for val in [0, 1]:
+        for x in edge[1:-1]:
+            for y in edge[1:-1]:
+                pts.append([x, y, val])
+
+    return torch.tensor(pts, dtype=dtype, device=device)
+
+
 def sobol_sampling(n_points, x_range=(0, 1), t_range=(0, 1), seed=42, dtype=torch.float64, device=None):
     device = device or torch.device('cpu')
     sampler = qmc.Sobol(d=2, scramble=True, seed=seed)
     sample = sampler.random(n_points)
     sample[:, 0] = sample[:, 0] * (x_range[1] - x_range[0]) + x_range[0]
     sample[:, 1] = sample[:, 1] * (t_range[1] - t_range[0]) + t_range[0]
+    return torch.tensor(sample, dtype=dtype, device=device)
+
+
+def sobol_cuboid_sampling(n_points, domain_bounds=(0, 1), dim=3, seed=42, dtype=torch.float64, device=None):
+    device = device or torch.device('cpu')
+    sampler = qmc.Sobol(d=dim, scramble=True, seed=seed)
+    sample = sampler.random(n_points)
+    lo, hi = domain_bounds
+    sample = lo + (hi - lo) * sample
     return torch.tensor(sample, dtype=dtype, device=device)
 
 

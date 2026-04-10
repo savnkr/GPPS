@@ -22,6 +22,14 @@ heat_equation:
     exclusion_radius: 0.05
     ar_ratio: 0.3
 
+  sdd:
+    batch_size: 20
+    beta: auto
+    rho: 0.98
+    r: 0.99
+    epochs_mean: 2000
+    epochs_var: 1000
+
   output:
     save_results: true
     results_dir: results/heat_equation
@@ -48,6 +56,14 @@ poisson_2d:
     ar_ratio: 0.3
     use_clustering: true
 
+  sdd:
+    batch_size: 20
+    beta: auto
+    rho: 0.98
+    r: 0.99
+    epochs_mean: 2000
+    epochs_var: 1000
+
   output:
     save_results: true
     results_dir: results/poisson_2d
@@ -66,7 +82,7 @@ poisson_3d:
     n_iterations: 10
     n_test: 500
     n_pool: 2000
-    jitter: 1.0e-6
+    jitter: 1.0e-2
 
   active_learning:
     acquisition_function: variance
@@ -75,6 +91,14 @@ poisson_3d:
     ar_ratio: 0.3
     use_clustering: true
     na_per_iter: 5
+
+  sdd:
+    batch_size: 100
+    beta: auto
+    rho: 0.9
+    r: 0.99
+    epochs_mean: 8000
+    epochs_var: 5000
 
   output:
     save_results: true

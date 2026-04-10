@@ -1,15 +1,19 @@
+import math
 import torch
 
 
 @torch.no_grad()
-def train_sdd(C, y, batch_size=20, beta='auto', rho=0.98, r=0.99,
-              num_epochs=2000, jitter=1e-6, sigma_n=0.0,
+def train_sdd(C, y, batch_size=20, beta='auto', rho=0.9,
+              num_epochs=2000, jitter=1e-6,
+              precondition=True, burn_in_frac=0.5,
+              epoch_scaling='auto',
               verbose=False, print_every=500):
     """
     Stochastic Dual Descent to approximate C^{-1}y without explicit matrix inversion.
 
     Solves the dual objective:  min_alpha  (1/2) alpha^T K alpha - y^T alpha
-    using mini-batch SGD with Nesterov momentum and iterate averaging.
+    using mini-batch SGD with heavy-ball momentum, Jacobi preconditioning,
+    and Polyak-Ruppert tail averaging.
 
     Reference: "Stochastic Gradient Descent for Gaussian Processes Done Right"
                Jihao Andreas Lin, Javier Antoran, Jose Miguel Hernandez-Lobato (2023).
@@ -18,13 +22,15 @@ def train_sdd(C, y, batch_size=20, beta='auto', rho=0.98, r=0.99,
         C: Covariance matrix [N, N]
         y: Target vector/matrix [N, du]
         batch_size: Mini-batch size B for stochastic gradient estimates
-        beta: Step size (learning rate). Use 'auto' to set adaptively based on
-              spectral radius of K and batch ratio N/B.
-        rho: Momentum parameter (Nesterov-style look-ahead)
-        r: Exponential moving average parameter for iterate averaging
-        num_epochs: Number of optimization iterations
+        beta: Step size (learning rate). Use 'auto' to set adaptively.
+        rho: Heavy-ball momentum parameter (default 0.9)
+        num_epochs: Base number of optimization iterations (scaled if epoch_scaling='auto')
         jitter: Regularization added to diagonal of C for numerical stability
-        sigma_n: Likelihood noise variance (0 for noiseless PDE constraints)
+        precondition: Use Jacobi (diagonal) preconditioning to improve conditioning
+        burn_in_frac: Fraction of epochs to discard before tail averaging (default 0.5)
+        epoch_scaling: 'auto' scales epochs as num_epochs * N/B * log(N)/log(B)
+                       to maintain convergence quality as N grows.
+                       'none' uses num_epochs directly.
         verbose: Whether to print convergence progress
         print_every: Frequency of progress printing (in iterations)
 
@@ -37,50 +43,60 @@ def train_sdd(C, y, batch_size=20, beta='auto', rho=0.98, r=0.99,
     device = C.device
     B = min(batch_size, N)
 
+    # Scale epochs with system size to maintain convergence quality
+    if epoch_scaling == 'auto' and N > B:
+        total_epochs = int(num_epochs * (N / B) * math.log(max(N, 2)) / math.log(max(B, 2)))
+    else:
+        total_epochs = num_epochs
+
     K = C + jitter * torch.eye(N, dtype=dtype, device=device)
 
-    # Auto-select step size for stability with Nesterov momentum.
-    # Effective step per gradient component is beta * (N/B).
-    # Stability requires: beta * (N/B) * lambda_max < 1 (conservative Nesterov bound).
+    # Jacobi (diagonal) preconditioner
+    if precondition:
+        P_inv = 1.0 / K.diag().clamp(min=1e-10)
+    else:
+        P_inv = torch.ones(N, dtype=dtype, device=device)
+
+    # Auto-select step size based on spectral radius of preconditioned system
     if beta == 'auto':
-        # Power iteration for largest eigenvalue (O(N^2) per iter, 20 iters)
         v = torch.randn(N, 1, dtype=dtype, device=device)
         for _ in range(30):
-            v = K @ v
+            v = P_inv.unsqueeze(1) * (K @ v)
             v = v / torch.norm(v)
-        lambda_max = (v.T @ K @ v).item()
-        beta = 0.5 * B / (N * lambda_max)
+        lambda_max_prec = (v.T @ (P_inv.unsqueeze(1) * (K @ v))).item()
+        beta = 0.5 * B / (N * lambda_max_prec)
         if verbose:
-            print(f"    SDD auto beta={beta:.4f} (lambda_max~{lambda_max:.4e}, N={N}, B={B})")
+            print(f"    SDD auto beta={beta:.6f} (prec_lmax~{lambda_max_prec:.2e}, "
+                  f"N={N}, B={B}, epochs={total_epochs})")
 
     A_t = torch.zeros(N, du, dtype=dtype, device=device)
     V_t = torch.zeros(N, du, dtype=dtype, device=device)
-    A_bar_t = torch.zeros(N, du, dtype=dtype, device=device)
+    A_bar = torch.zeros(N, du, dtype=dtype, device=device)
 
-    for t in range(num_epochs):
-        # Nesterov-style look-ahead
-        S = A_t + rho * V_t
+    burn_in = int(total_epochs * burn_in_frac)
+    n_avg = 0
 
-        # Mini-batch sampling (without replacement for unbiased gradient)
+    for t in range(total_epochs):
+        # Mini-batch sampling (without replacement)
         It = torch.randperm(N, device=device)[:B]
 
-        # Stochastic gradient: unbiased estimate of (K @ alpha - y)
-        # Only non-zero at sampled indices, scaled by N/B for unbiasedness
+        # Preconditioned stochastic gradient (heavy-ball: gradient at current position)
+        raw_grad = K[It] @ A_t - y[It]
         G_t = torch.zeros(N, du, dtype=dtype, device=device)
-        G_t[It] = (N / B) * (K[It] @ S - y[It])
+        G_t[It] = (N / B) * P_inv[It].unsqueeze(1) * raw_grad
 
-        # Momentum update
+        # Heavy-ball momentum update
         V_t = rho * V_t - beta * G_t
         A_t = A_t + V_t
 
-        # Iterate averaging (Polyak-Ruppert style with EMA)
-        A_bar_t = r * A_t + (1 - r) * A_bar_t
+        # Tail averaging: only average iterates after burn-in
+        if t >= burn_in:
+            n_avg += 1
+            A_bar = A_bar + (A_t - A_bar) / n_avg
 
-        if verbose and (t % print_every == 0 or t == num_epochs - 1):
-            pred = K @ A_t
-            loss = 0.5 * torch.norm(y - pred) ** 2
-            if sigma_n > 0:
-                loss += (sigma_n / 2) * torch.sum(A_t * (K @ A_t))
-            print(f"    SDD step {t}/{num_epochs}, loss: {loss.item():.6e}")
+        if verbose and (t % print_every == 0 or t == total_epochs - 1):
+            out = A_bar if n_avg > 0 else A_t
+            loss = 0.5 * torch.norm(y - K @ out) ** 2
+            print(f"    SDD step {t}/{total_epochs}, loss: {loss.item():.6e}")
 
-    return A_bar_t
+    return A_bar if n_avg > 0 else A_t

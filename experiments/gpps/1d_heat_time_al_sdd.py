@@ -48,7 +48,6 @@ def build_sdd_cfg(cfg):
         'batch_size': cfg['sdd']['batch_size'],
         'beta': cfg['sdd']['beta'],
         'rho': cfg['sdd']['rho'],
-        'r': cfg['sdd']['r'],
         'jitter': cfg['training']['jitter'],
     }
 

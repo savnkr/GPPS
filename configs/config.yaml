@@ -25,8 +25,7 @@ heat_equation:
   sdd:
     batch_size: 20
     beta: auto
-    rho: 0.98
-    r: 0.99
+    rho: 0.9
     epochs_mean: 2000
     epochs_var: 1000
 
@@ -59,8 +58,7 @@ poisson_2d:
   sdd:
     batch_size: 20
     beta: auto
-    rho: 0.98
-    r: 0.99
+    rho: 0.9
     epochs_mean: 2000
     epochs_var: 1000
 
@@ -82,7 +80,7 @@ poisson_3d:
     n_iterations: 10
     n_test: 500
     n_pool: 2000
-    jitter: 1.0e-2
+    jitter: 1.0e-3
 
   active_learning:
     acquisition_function: variance
@@ -93,12 +91,11 @@ poisson_3d:
     na_per_iter: 5
 
   sdd:
-    batch_size: 100
+    batch_size: 50
     beta: auto
     rho: 0.9
-    r: 0.99
-    epochs_mean: 8000
-    epochs_var: 5000
+    epochs_mean: 2000
+    epochs_var: 1000
 
   output:
     save_results: true

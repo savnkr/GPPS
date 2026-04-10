@@ -45,7 +45,6 @@ def build_sdd_cfg(cfg):
         'batch_size': cfg['sdd']['batch_size'],
         'beta': cfg['sdd']['beta'],
         'rho': cfg['sdd']['rho'],
-        'r': cfg['sdd']['r'],
         'jitter': cfg['training']['jitter'],
     }
 
@@ -87,6 +86,7 @@ def run_gp_prediction_sdd(solver, Xi, Xb, f_Xi, g_Xb, X_test, actual, sdd_cfg,
 def create_row_plot(X_test_np, ground_truth, prediction, error, std_dev,
                     save_path='row_al_sdd_cluster_poisson_3d.html',
                     title_text='3D Poisson — GP + AL + SDD (Clustering)'):
+    """Solid cube with a single mid-plane slice visible inside."""
     from scipy.interpolate import griddata
 
     fig = make_subplots(
@@ -96,10 +96,15 @@ def create_row_plot(X_test_np, ground_truth, prediction, error, std_dev,
         horizontal_spacing=0.02,
     )
 
-    n_grid = 25
+    n_grid = 30
     xg = np.linspace(0, 1, n_grid)
-    Xg, Yg, Zg = np.meshgrid(xg, xg, xg, indexing='ij')
+    yg = np.linspace(0, 1, n_grid)
+    zg = np.linspace(0, 1, n_grid)
+    Xg, Yg, Zg = np.meshgrid(xg, yg, zg, indexing='ij')
     coords = X_test_np[:, :3]
+
+    # 2D grids for cube faces
+    X2, Y2 = np.meshgrid(xg, yg, indexing='ij')
 
     datasets = [
         (ground_truth, 'Viridis'),
@@ -110,18 +115,43 @@ def create_row_plot(X_test_np, ground_truth, prediction, error, std_dev,
 
     for col, (vals, cscale) in enumerate(datasets, 1):
         vol = griddata(coords, vals, (Xg, Yg, Zg), method='linear', fill_value=0.0)
+        vmin, vmax = float(np.nanmin(vals)), float(np.nanmax(vals))
+        mid = n_grid // 2
 
-        fig.add_trace(go.Volume(
-            x=Xg.flatten(), y=Yg.flatten(), z=Zg.flatten(),
-            value=vol.flatten(),
-            isomin=float(np.nanmin(vals)),
-            isomax=float(np.nanmax(vals)),
-            opacity=0.1,
-            surface_count=15,
+        # 6 cube faces: (x_coords, y_coords, z_coords, surfacecolor)
+        faces = [
+            (X2, Y2, np.zeros_like(X2), vol[:, :, 0]),       # z=0 (bottom)
+            (X2, Y2, np.ones_like(X2), vol[:, :, -1]),        # z=1 (top)
+            (X2, np.zeros_like(X2), Y2, vol[:, 0, :]),        # y=0 (front)
+            (X2, np.ones_like(X2), Y2, vol[:, -1, :]),        # y=1 (back)
+            (np.zeros_like(X2), X2, Y2, vol[0, :, :]),        # x=0 (left)
+            (np.ones_like(X2), X2, Y2, vol[-1, :, :]),        # x=1 (right)
+        ]
+
+        # Mid-plane slice at z=0.5
+        midplane = (X2, Y2, np.full_like(X2, zg[mid]), vol[:, :, mid])
+
+        # Draw cube faces (semi-transparent so mid-plane is visible inside)
+        for i, (fx, fy, fz, fval) in enumerate(faces):
+            fig.add_trace(go.Surface(
+                x=fx, y=fy, z=fz,
+                surfacecolor=fval,
+                colorscale=cscale,
+                cmin=vmin, cmax=vmax,
+                opacity=0.55,
+                showscale=False,
+            ), row=1, col=col)
+
+        # Draw mid-plane slice (fully opaque, visible through semi-transparent faces)
+        mx, my, mz, mval = midplane
+        fig.add_trace(go.Surface(
+            x=mx, y=my, z=mz,
+            surfacecolor=mval,
             colorscale=cscale,
+            cmin=vmin, cmax=vmax,
+            opacity=1.0,
             showscale=True,
             colorbar=dict(len=0.6, thickness=15),
-            caps=dict(x_show=True, y_show=True, z_show=True),
         ), row=1, col=col)
 
     scene_cfg = dict(

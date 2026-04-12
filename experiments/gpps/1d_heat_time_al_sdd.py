@@ -22,8 +22,19 @@ import matplotlib.pyplot as plt
 from src import (
     RBFKernel, HeatEquationOperators, GPPDESolver,
     generate_spacetime_domain, sobol_sampling,
-    adaptive_sampling_sdd, train_sdd, HeatEquationFDM
+    adaptive_sampling_sdd, train_sdd, HeatEquationFDM,
+    optimize_hyperparameters_sdd
 )
+
+EXPERIMENT_SEED = 100
+
+
+def set_experiment_seed(seed=EXPERIMENT_SEED):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+
+set_experiment_seed()
 
 
 def load_config(config_path):
@@ -52,8 +63,29 @@ def build_sdd_cfg(cfg):
     }
 
 
+def build_heat_solver(cfg, device, dtype):
+    kernel = RBFKernel(
+        lengthscale=cfg['kernel']['lengthscale'],
+        variance=cfg['kernel']['variance'],
+        device=device
+    ).to(dtype)
+    operators = HeatEquationOperators(kernel, alpha=cfg['pde']['alpha'])
+    return GPPDESolver(kernel, operators)
+
+
+def format_lengthscale(value):
+    arr = np.asarray(value, dtype=float).reshape(-1)
+    if arr.size == 1:
+        return f"{arr[0]:.4f}"
+    return "[" + ", ".join(f"{v:.4f}" for v in arr) + "]"
+
+
 def sdd_posterior_stats(solver, X_test, Xi, Xd, Xn, C_full, y_obs, sdd_cfg, epochs_mean, epochs_var):
-    """Compute posterior mean and diagonal variance using SDD."""
+    """Compute posterior mean and diagonal variance using SDD.
+
+    Returns correction (k* C^-1 k*^T) separately since base_var - correction
+    suffers from catastrophic cancellation when correction ≈ base_var.
+    """
     cfg_mean = {**sdd_cfg, 'num_epochs': epochs_mean}
     A_mean = train_sdd(C_full, y_obs, **cfg_mean, verbose=False)
 
@@ -67,37 +99,50 @@ def sdd_posterior_stats(solver, X_test, Xi, Xd, Xn, C_full, y_obs, sdd_cfg, epoc
     correction = torch.sum(cov_vec * A_var.T, dim=1)
     pred_var = torch.clamp(base_var - correction, min=1e-10)
 
-    return pred_mean, pred_var.cpu().numpy(), A_mean
+    return pred_mean, pred_var.cpu().numpy(), correction.cpu().numpy()
 
 
-def run_active_learning_sdd(solver, Xi, Xd, Xn, X_pool, X_test, u_ref, cfg, device):
+def run_active_learning_sdd(solver, Xi, Xd, Xn, X_pool, X_test, u_ref, cfg, device,
+                            optimize_hp=False, hp_every=2):
     dtype = torch.float64
     n_per_iter = (cfg['training']['n_final'] - cfg['training']['n_initial']) // cfg['training']['n_iterations']
     sdd_cfg = build_sdd_cfg(cfg)
+    hp_sdd_cfg = {**sdd_cfg, 'num_epochs': 1000}
 
     g_Xd = torch.sin(torch.pi * Xd[:, 0]).reshape(-1, 1).to(device)
     g_Xn = torch.zeros(Xn.shape[0], 1, dtype=dtype, device=device)
 
     Xi_active = Xi.clone()
-    errors, variances, n_points = [], [], [Xi_active.shape[0]]
+    errors, max_errors, n_points = [], [], [Xi_active.shape[0]]
 
     for it in range(cfg['training']['n_iterations'] + 1):
         f_Xi = torch.zeros(Xi_active.shape[0], 1, dtype=dtype, device=device)
         y_obs = torch.cat((f_Xi, g_Xd, g_Xn), dim=0)
 
+        if optimize_hp and it > 0 and it % hp_every == 0:
+            Xi_ref = Xi_active
+            compute_cov = lambda: solver.compute_covariance_matrix(Xi_ref, Xd, Xn)
+            ls, var = optimize_hyperparameters_sdd(
+                solver.kernel, compute_cov, y_obs, hp_sdd_cfg,
+                jitter=cfg['training']['jitter'], verbose=True,
+                observation_group_sizes=[Xi_active.shape[0], Xd.shape[0], Xn.shape[0]],
+            )
+            print(f"  Updated HP: ls={format_lengthscale(ls)}, var={var:.4f}")
+
         C_full = solver.compute_covariance_matrix(Xi_active, Xd, Xn)
 
         # Evaluate at test points using SDD
-        pred_mean, pred_var, _ = sdd_posterior_stats(
+        pred_mean, pred_var, correction = sdd_posterior_stats(
             solver, X_test, Xi_active, Xd, Xn, C_full, y_obs, sdd_cfg,
             cfg['sdd']['epochs_mean'], cfg['sdd']['epochs_var']
         )
 
         error = np.abs(pred_mean.cpu().numpy().reshape(-1) - u_ref)
         errors.append(np.mean(error))
-        variances.append(np.mean(pred_var))
+        max_errors.append(np.max(error))
 
-        print(f"Iter {it}: Points={Xi_active.shape[0]}, MAE={errors[-1]:.6f}, Var={variances[-1]:.6f}")
+        print(f"Iter {it}: Points={Xi_active.shape[0]}, MAE={errors[-1]:.6f}, "
+              f"MaxErr={max_errors[-1]:.6f}")
 
         if it < cfg['training']['n_iterations']:
             acq_sdd_cfg = {**sdd_cfg, 'num_epochs': cfg['sdd']['epochs_var']}
@@ -115,34 +160,57 @@ def run_active_learning_sdd(solver, Xi, Xd, Xn, X_pool, X_test, u_ref, cfg, devi
 
     pred_std = np.sqrt(np.clip(pred_var, 1e-12, None))
     return {
-        'points': n_points, 'errors': errors, 'variances': variances,
+        'points': n_points, 'errors': errors, 'max_errors': max_errors,
         'Xi_final': Xi_active, 'pred_mean': pred_mean, 'pred_std': pred_std
     }
 
 
-def run_random_baseline_sdd(solver, Xd, Xn, X_pool, X_test, u_ref, n_points, cfg, device):
+def run_random_baseline_sdd(solver, Xd, Xn, X_pool, X_test, u_ref, cfg, device,
+                            optimize_hp=False, hp_every=2, random_seed=EXPERIMENT_SEED):
+    set_experiment_seed(random_seed)
     dtype = torch.float64
     sdd_cfg = build_sdd_cfg(cfg)
+    hp_sdd_cfg = {**sdd_cfg, 'num_epochs': 1000}
+    n_initial = cfg['training']['n_initial']
+    n_final = cfg['training']['n_final']
+    n_per_iter = (n_final - n_initial) // cfg['training']['n_iterations']
 
     perm = torch.randperm(X_pool.size(0))
-    Xi_random = X_pool[perm[:n_points]]
+    Xi_random_full = X_pool[perm[:n_final]]
+    Xi_random = Xi_random_full[:n_initial].clone()
 
     g_Xd = torch.sin(torch.pi * Xd[:, 0]).reshape(-1, 1).to(device)
     g_Xn = torch.zeros(Xn.shape[0], 1, dtype=dtype, device=device)
-    f_Xi = torch.zeros(Xi_random.shape[0], 1, dtype=dtype, device=device)
-    y_obs = torch.cat((f_Xi, g_Xd, g_Xn), dim=0)
+
+    for it in range(cfg['training']['n_iterations'] + 1):
+        f_Xi = torch.zeros(Xi_random.shape[0], 1, dtype=dtype, device=device)
+        y_obs = torch.cat((f_Xi, g_Xd, g_Xn), dim=0)
+
+        if optimize_hp and it > 0 and it % hp_every == 0:
+            Xi_ref = Xi_random
+            compute_cov = lambda: solver.compute_covariance_matrix(Xi_ref, Xd, Xn)
+            optimize_hyperparameters_sdd(
+                solver.kernel, compute_cov, y_obs, hp_sdd_cfg,
+                jitter=cfg['training']['jitter'], verbose=False,
+                observation_group_sizes=[Xi_random.shape[0], Xd.shape[0], Xn.shape[0]],
+            )
+
+        if it < cfg['training']['n_iterations']:
+            next_size = min(n_initial + (it + 1) * n_per_iter, n_final)
+            Xi_random = Xi_random_full[:next_size].clone()
 
     C_full = solver.compute_covariance_matrix(Xi_random, Xd, Xn)
-    pred_mean, pred_var, _ = sdd_posterior_stats(
+    pred_mean, pred_var, correction = sdd_posterior_stats(
         solver, X_test, Xi_random, Xd, Xn, C_full, y_obs, sdd_cfg,
         cfg['sdd']['epochs_mean'], cfg['sdd']['epochs_var']
     )
     pred_std = np.sqrt(np.clip(pred_var, 1e-12, None))
 
-    error = np.mean(np.abs(pred_mean.cpu().numpy().reshape(-1) - u_ref))
-    variance = np.mean(pred_var)
+    abs_error = np.abs(pred_mean.cpu().numpy().reshape(-1) - u_ref)
+    error = np.mean(abs_error)
+    max_error = np.max(abs_error)
 
-    return {'error': error, 'variance': variance, 'Xi': Xi_random,
+    return {'error': error, 'max_error': max_error, 'Xi': Xi_random,
             'pred_mean': pred_mean, 'pred_std': pred_std}
 
 
@@ -205,12 +273,12 @@ def plot_results(al_results, random_results, X_test, u_ref, Xd, Xn, cfg, output_
     ax1.set_title('Error Convergence')
     ax1.legend(); ax1.grid(True, alpha=0.3)
 
-    ax2.plot(al_results['points'], al_results['variances'], 'o-', color='#1f77b4', linewidth=2, label='AL + SDD')
-    ax2.axhline(y=random_results['variance'], color='#d62728', linestyle='--', linewidth=1.5,
+    ax2.plot(al_results['points'], al_results['max_errors'], 'o-', color='#1f77b4', linewidth=2, label='AL + SDD')
+    ax2.axhline(y=random_results['max_error'], color='#d62728', linestyle='--', linewidth=1.5,
                 label=f'Random+SDD ({cfg["training"]["n_final"]} pts)')
     ax2.set_xlabel('Number of Training Points')
-    ax2.set_ylabel('Mean Posterior Variance')
-    ax2.set_title('Uncertainty Reduction')
+    ax2.set_ylabel('Max Absolute Error')
+    ax2.set_title('Worst-Case Error')
     ax2.legend(); ax2.grid(True, alpha=0.3)
 
     plt.tight_layout()
@@ -228,11 +296,11 @@ def save_results(results, output_dir):
         output_dir / 'results_al_sdd.npz',
         al_points=results['active']['points'],
         al_errors=results['active']['errors'],
-        al_variances=results['active']['variances'],
+        al_max_errors=results['active']['max_errors'],
         al_Xi=results['active']['Xi_final'].cpu().numpy(),
         al_pred=results['active']['pred_mean'].cpu().numpy(),
         random_error=results['random']['error'],
-        random_variance=results['random']['variance'],
+        random_max_error=results['random']['max_error'],
         random_Xi=results['random']['Xi'].cpu().numpy(),
         random_pred=results['random']['pred_mean'].cpu().numpy(),
         X_test=results['X_test'].cpu().numpy(),
@@ -242,6 +310,14 @@ def save_results(results, output_dir):
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--optimize-hp', action='store_true',
+                        help='Enable SDD-based kernel hyperparameter optimization during AL')
+    parser.add_argument('--hp-every', type=int, default=2,
+                        help='Optimize hyperparameters every N AL iterations (default: 2)')
+    args = parser.parse_args()
+
     config_path = ROOT_DIR / 'configs' / 'config.yaml'
     cfg = load_config(config_path)
     device = setup_device()
@@ -249,6 +325,8 @@ def main():
 
     print(f"Using device: {device}")
     print("Inference method: Stochastic Dual Descent (SDD)")
+    if args.optimize_hp:
+        print(f"Hyperparameter optimization: ON (every {args.hp_every} iterations)")
 
     _, Xd, Xn, _, _, _ = generate_spacetime_domain(
         n_samples_per_side=int(np.sqrt(cfg['training']['n_initial'])),
@@ -263,24 +341,24 @@ def main():
     ref_solver = HeatEquationFDM(N_x=n_grid, N_t=n_grid, alpha=cfg['pde']['alpha'])
     u_ref = ref_solver.interpolate(X_test.cpu())
 
-    kernel = RBFKernel(
-        lengthscale=cfg['kernel']['lengthscale'],
-        variance=cfg['kernel']['variance'],
-        device=device
-    ).to(dtype)
-    operators = HeatEquationOperators(kernel, alpha=cfg['pde']['alpha'])
-    solver = GPPDESolver(kernel, operators)
+    solver = build_heat_solver(cfg, device, dtype)
 
     print("\n=== Active Learning + SDD ===")
-    al_results = run_active_learning_sdd(solver, Xi_initial, Xd, Xn, X_pool, X_test, u_ref, cfg, device)
+    set_experiment_seed()
+    al_results = run_active_learning_sdd(
+        solver, Xi_initial, Xd, Xn, X_pool, X_test, u_ref, cfg, device,
+        optimize_hp=args.optimize_hp, hp_every=args.hp_every
+    )
 
     print("\n=== Random Baseline + SDD ===")
+    random_solver = build_heat_solver(cfg, device, dtype)
     random_results = run_random_baseline_sdd(
-        solver, Xd, Xn, X_pool, X_test, u_ref,
-        n_points=cfg['training']['n_final'], cfg=cfg, device=device
+        random_solver, Xd, Xn, X_pool, X_test, u_ref,
+        cfg=cfg, device=device,
+        optimize_hp=args.optimize_hp, hp_every=args.hp_every
     )
     print(f"Random+SDD: Points={cfg['training']['n_final']}, MAE={random_results['error']:.6f}, "
-          f"Var={random_results['variance']:.6f}")
+          f"MaxErr={random_results['max_error']:.6f}")
 
     print("\n=== Results Summary ===")
     print(f"AL + SDD:      MAE={al_results['errors'][-1]:.6f}")

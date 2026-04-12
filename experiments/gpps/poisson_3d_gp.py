@@ -25,6 +25,20 @@ def source_term(X):
     return -3 * (np.pi ** 2) * torch.sin(np.pi * X[:, 0]) * torch.sin(np.pi * X[:, 1]) * torch.sin(np.pi * X[:, 2])
 
 
+def _write_plotly_exports(fig, html_path, *, width, height, png_scale=3, pdf_scale=2):
+    """Always save HTML; best-effort static export when Chrome/Kaleido works."""
+    fig.write_html(html_path)
+    try:
+        fig.write_image(html_path.replace('.html', '.pdf'), format='pdf',
+                        width=width, height=height, scale=pdf_scale)
+        fig.write_image(html_path.replace('.html', '.png'), format='png',
+                        width=width, height=height, scale=png_scale)
+        print(f"Saved: {html_path} (+pdf, +png)")
+    except Exception as exc:
+        print(f"Saved: {html_path}")
+        print(f"Warning: static Plotly export skipped: {exc}")
+
+
 def make_cube_slices(values, coords, title, colorscale='Viridis', n_grid=30):
     x, y, z = coords[:, 0], coords[:, 1], coords[:, 2]
 
@@ -159,10 +173,7 @@ def create_row_plot(X_test_np, ground_truth, prediction, error, std_dev, save_pa
         title=dict(text='3D Poisson — GP (No Active Learning)', x=0.5, font=dict(size=18)),
     )
 
-    fig.write_html(save_path)
-    fig.write_image(save_path.replace('.html', '.pdf'), format='pdf', width=1600, height=400, scale=2)
-    fig.write_image(save_path.replace('.html', '.png'), format='png', width=1600, height=400, scale=3)
-    print(f"Saved row plot to {save_path} (+pdf, +png)")
+    _write_plotly_exports(fig, save_path, width=1600, height=400)
     return fig
 
 
@@ -195,10 +206,10 @@ def run(n_interior_per_side=6, n_boundary_per_side=8, n_test=500,
     print("Computing posterior predictions...")
     post_mean = solver.posterior_mean(X_test, Xi, Xb, C_inv, y_obs).detach()
     post_cov = solver.posterior_covariance(X_test, X_test.clone(), Xi, Xb, C_inv).detach()
-    post_std = torch.sqrt(torch.clamp(torch.diag(post_cov), min=1e-12)).numpy()
+    post_std = torch.sqrt(torch.clamp(torch.diag(post_cov), min=1e-12)).cpu().numpy()
 
-    X_test_np = X_test.numpy()
-    pred_np = post_mean.numpy().reshape(-1)
+    X_test_np = X_test.cpu().numpy()
+    pred_np = post_mean.cpu().numpy().reshape(-1)
     truth = exact_solution(X_test_np)
     error = np.abs(pred_np - truth)
 
@@ -216,7 +227,7 @@ def run(n_interior_per_side=6, n_boundary_per_side=8, n_test=500,
         ground_truth=truth,
         error=error,
         std_dev=post_std,
-        Xi=Xi.numpy(), Xb=Xb.numpy(),
+        Xi=Xi.cpu().numpy(), Xb=Xb.cpu().numpy(),
     )
 
     fig = create_row_plot(
@@ -231,9 +242,12 @@ def run(n_interior_per_side=6, n_boundary_per_side=8, n_test=500,
         ('std_deviation', post_std, 'Plasma'),
     ]:
         f = make_cube_slices(vals, X_test_np, name.replace('_', ' ').title(), cscale)
-        f.write_html(os.path.join(save_dir, f'gp_{name}.html'))
-        f.write_image(os.path.join(save_dir, f'gp_{name}.pdf'), format='pdf', width=450, height=400, scale=2)
-        f.write_image(os.path.join(save_dir, f'gp_{name}.png'), format='png', width=450, height=400, scale=3)
+        _write_plotly_exports(
+            f,
+            os.path.join(save_dir, f'gp_{name}.html'),
+            width=450,
+            height=400,
+        )
 
     print(f"\nAll results saved to {save_dir}/")
     return fig

@@ -12,6 +12,7 @@ from .active_learning import (
     adaptive_sampling, adaptive_sampling_poisson, ucb_acquisition,
     adaptive_sampling_sdd, adaptive_sampling_poisson_sdd
 )
+from .hyperparameter_opt import optimize_hyperparameters_sdd
 from .reference_solver import HeatEquationFDM
 
 __all__ = [
@@ -34,5 +35,6 @@ __all__ = [
     'adaptive_sampling_sdd',
     'adaptive_sampling_poisson_sdd',
     'ucb_acquisition',
+    'optimize_hyperparameters_sdd',
     'HeatEquationFDM'
 ]

@@ -8,6 +8,33 @@ def ucb_acquisition(mean, variance, kappa=2.0):
     return mean + kappa * torch.sqrt(variance)
 
 
+def _select_from_clusters(retained, retained_acq_values, na):
+    """Select the highest-acquisition-value point from each KMeans cluster.
+
+    Instead of picking the point closest to the cluster center (which ignores
+    acquisition values), pick the best point *within* each cluster. This gives
+    spatial diversity from clustering while respecting the acquisition function.
+    """
+    retained_np = retained.cpu().detach().numpy()
+    n_clusters = min(na, retained_np.shape[0])
+
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10).fit(retained_np)
+    labels = kmeans.labels_
+
+    acq_np = retained_acq_values.cpu().detach().numpy().reshape(-1)
+
+    selected = []
+    for c in range(n_clusters):
+        mask = labels == c
+        if not np.any(mask):
+            continue
+        cluster_indices = np.where(mask)[0]
+        best_in_cluster = cluster_indices[np.argmax(acq_np[cluster_indices])]
+        selected.append(retained[best_in_cluster])
+
+    return torch.stack(selected) if selected else retained[:na]
+
+
 def adaptive_sampling(solver, X_pool, X_train, Xd, Xn, y_train, na=5, kappa=2.0,
                      exclusion_radius=0.05, acquisition_function="variance", ar_ratio=0.3):
     C_full = solver.compute_covariance_matrix(X_train, Xd, Xn)
@@ -33,22 +60,13 @@ def adaptive_sampling(solver, X_pool, X_train, Xd, Xn, y_train, na=5, kappa=2.0,
 
     sorted_indices = torch.argsort(acquisition_values.squeeze(), descending=True)
     sorted_candidates = X_pool_filtered[sorted_indices]
+    sorted_acq = acquisition_values[sorted_indices]
 
     ar = max(int(ar_ratio * sorted_candidates.size(0)), na * 2)
     retained = sorted_candidates[:ar]
+    retained_acq = sorted_acq[:ar]
 
-    retained_np = retained.cpu().detach().numpy()
-    n_clusters = min(na, retained_np.shape[0])
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10).fit(retained_np)
-    centers = kmeans.cluster_centers_
-
-    selected = []
-    for i in range(n_clusters):
-        dists = np.sum((retained_np - centers[i])**2, axis=1)
-        idx = np.argmin(dists)
-        selected.append(retained[idx])
-
-    return torch.stack(selected) if selected else retained[:na]
+    return _select_from_clusters(retained, retained_acq, na)
 
 
 def adaptive_sampling_sdd(solver, X_pool, X_train, Xd, Xn, y_train, C_full, sdd_cfg,
@@ -57,21 +75,6 @@ def adaptive_sampling_sdd(solver, X_pool, X_train, Xd, Xn, y_train, C_full, sdd_
     """
     SDD-based adaptive sampling for PDEs with mixed boundary conditions (e.g. heat equation).
     Uses Stochastic Dual Descent instead of exact matrix inversion for scalability.
-
-    Args:
-        solver: GPPDESolver instance
-        X_pool: Candidate pool [N_pool, d]
-        X_train: Current interior training points [M, d]
-        Xd: Dirichlet boundary points
-        Xn: Neumann boundary points
-        y_train: Training targets [N_total, 1]
-        C_full: Pre-computed covariance matrix [N_total, N_total]
-        sdd_cfg: Dict with SDD params (batch_size, beta, rho, r, num_epochs, jitter)
-        na: Number of points to acquire
-        kappa: UCB exploration parameter
-        exclusion_radius: Minimum distance from existing points
-        acquisition_function: "variance" or "ucb"
-        ar_ratio: Fraction of top candidates retained before clustering
     """
     from .sdd import train_sdd
 
@@ -82,47 +85,41 @@ def adaptive_sampling_sdd(solver, X_pool, X_train, Xd, Xn, y_train, C_full, sdd_
         print("Warning: No valid candidates remain after filtering.")
         return torch.zeros((0, dim), dtype=X_pool.dtype, device=X_pool.device)
 
-    # SDD for mean: A_mean ≈ C^{-1} y
+    # SDD for mean
     A_mean = train_sdd(C_full, y_train, **sdd_cfg, verbose=False)
 
     # Posterior mean at pool points
     cov_vec = solver.compute_covariance_vector(X_pool_filtered, X_train, Xd, Xn).detach()
     mean = cov_vec @ A_mean
 
-    # SDD for variance: A_var ≈ C^{-1} c(X_pool)^T
-    sdd_cfg_var = {**sdd_cfg, 'num_epochs': max(sdd_cfg.get('num_epochs', 2000) // 2, 200)}
-    A_var = train_sdd(C_full, cov_vec.T, **sdd_cfg_var, verbose=False)
+    # SDD for variance: use correction as acquisition signal directly
+    # (avoids catastrophic cancellation in var = k(x,x) - correction)
+    A_var = train_sdd(C_full, cov_vec.T, **sdd_cfg, verbose=False)
 
-    # Diagonal variance: Var(x) = k(x,x) - c(x)^T C^{-1} c(x)
-    base_var = solver.kernel.variance.detach() ** 2
     correction = torch.sum(cov_vec * A_var.T, dim=1)
+    base_var = solver.kernel.variance.detach() ** 2
     variance = torch.clamp(base_var - correction, min=1e-10).unsqueeze(1)
 
+    # For acquisition: use NEGATIVE correction (higher correction = lower variance = less interesting)
+    # This avoids catastrophic cancellation: ranking by -correction == ranking by variance
+    acquisition_proxy = -correction.unsqueeze(1)
+
     if acquisition_function == "variance":
-        acquisition_values = variance
+        acquisition_values = acquisition_proxy
     elif acquisition_function == "ucb":
         acquisition_values = ucb_acquisition(mean, variance, kappa)
     else:
-        acquisition_values = variance
+        acquisition_values = acquisition_proxy
 
     sorted_indices = torch.argsort(acquisition_values.squeeze(), descending=True)
     sorted_candidates = X_pool_filtered[sorted_indices]
+    sorted_acq = acquisition_values[sorted_indices]
 
     ar = max(int(ar_ratio * sorted_candidates.size(0)), na * 2)
     retained = sorted_candidates[:ar]
+    retained_acq = sorted_acq[:ar]
 
-    retained_np = retained.cpu().detach().numpy()
-    n_clusters = min(na, retained_np.shape[0])
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10).fit(retained_np)
-    centers = kmeans.cluster_centers_
-
-    selected = []
-    for i in range(n_clusters):
-        dists = np.sum((retained_np - centers[i])**2, axis=1)
-        idx = np.argmin(dists)
-        selected.append(retained[idx])
-
-    return torch.stack(selected) if selected else retained[:na]
+    return _select_from_clusters(retained, retained_acq, na)
 
 
 def adaptive_sampling_poisson(solver, X_pool, X_train, Xb, y_train, na=5, kappa=2.0,
@@ -156,21 +153,12 @@ def adaptive_sampling_poisson(solver, X_pool, X_train, Xb, y_train, na=5, kappa=
         na_available = min(na, sorted_indices.shape[0])
         return sorted_candidates[:na_available]
 
+    sorted_acq = acquisition_values[sorted_indices]
     ar = max(int(ar_ratio * sorted_candidates.size(0)), na * 2)
     retained = sorted_candidates[:ar]
+    retained_acq = sorted_acq[:ar]
 
-    retained_np = retained.cpu().detach().numpy()
-    n_clusters = min(na, retained_np.shape[0])
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10).fit(retained_np)
-    centers = kmeans.cluster_centers_
-
-    selected = []
-    for i in range(n_clusters):
-        dists = np.sum((retained_np - centers[i])**2, axis=1)
-        idx = np.argmin(dists)
-        selected.append(retained[idx])
-
-    return torch.stack(selected) if selected else retained[:na]
+    return _select_from_clusters(retained, retained_acq, na)
 
 
 def adaptive_sampling_poisson_sdd(solver, X_pool, X_train, Xb, y_train, C_full, sdd_cfg,
@@ -180,21 +168,6 @@ def adaptive_sampling_poisson_sdd(solver, X_pool, X_train, Xb, y_train, C_full, 
     """
     SDD-based adaptive sampling for Poisson equation with Dirichlet BCs.
     Uses Stochastic Dual Descent instead of exact matrix inversion for scalability.
-
-    Args:
-        solver: GPPoissonSolver instance
-        X_pool: Candidate pool [N_pool, d]
-        X_train: Current interior training points [M, d]
-        Xb: Boundary points
-        y_train: Training targets [N_total, 1]
-        C_full: Pre-computed covariance matrix [N_total, N_total]
-        sdd_cfg: Dict with SDD params (batch_size, beta, rho, r, num_epochs, jitter)
-        na: Number of points to acquire
-        kappa: UCB exploration parameter
-        exclusion_radius: Minimum distance from existing points
-        acquisition_function: "variance" or "ucb"
-        ar_ratio: Fraction of top candidates retained before clustering
-        use_clustering: Whether to use KMeans clustering for spatial diversity
     """
     from .sdd import train_sdd
 
@@ -205,27 +178,29 @@ def adaptive_sampling_poisson_sdd(solver, X_pool, X_train, Xb, y_train, C_full, 
         print("Warning: No valid candidates remain after filtering.")
         return torch.zeros((0, dim), dtype=X_pool.dtype, device=X_pool.device)
 
-    # SDD for mean: A_mean ≈ C^{-1} y
+    # SDD for mean
     A_mean = train_sdd(C_full, y_train, **sdd_cfg, verbose=False)
 
     # Posterior mean at pool points
     cov_vec = solver.compute_covariance_vector(X_pool_filtered, X_train, Xb).detach()
     mean = cov_vec @ A_mean
 
-    # SDD for variance: A_var ≈ C^{-1} c(X_pool)^T
-    sdd_cfg_var = {**sdd_cfg, 'num_epochs': max(sdd_cfg.get('num_epochs', 2000) // 2, 200)}
-    A_var = train_sdd(C_full, cov_vec.T, **sdd_cfg_var, verbose=False)
+    # SDD for variance
+    A_var = train_sdd(C_full, cov_vec.T, **sdd_cfg, verbose=False)
 
-    base_var = solver.kernel.variance.detach() ** 2
     correction = torch.sum(cov_vec * A_var.T, dim=1)
+    base_var = solver.kernel.variance.detach() ** 2
     variance = torch.clamp(base_var - correction, min=1e-10).unsqueeze(1)
 
+    # Use negative correction as acquisition proxy to avoid catastrophic cancellation
+    acquisition_proxy = -correction.unsqueeze(1)
+
     if acquisition_function == "variance":
-        acquisition_values = variance
+        acquisition_values = acquisition_proxy
     elif acquisition_function == "ucb":
         acquisition_values = ucb_acquisition(mean, variance, kappa)
     else:
-        acquisition_values = variance
+        acquisition_values = acquisition_proxy
 
     sorted_indices = torch.argsort(acquisition_values.squeeze(), descending=True)
     sorted_candidates = X_pool_filtered[sorted_indices]
@@ -234,18 +209,9 @@ def adaptive_sampling_poisson_sdd(solver, X_pool, X_train, Xb, y_train, C_full, 
         na_available = min(na, sorted_indices.shape[0])
         return sorted_candidates[:na_available]
 
+    sorted_acq = acquisition_values[sorted_indices]
     ar = max(int(ar_ratio * sorted_candidates.size(0)), na * 2)
     retained = sorted_candidates[:ar]
+    retained_acq = sorted_acq[:ar]
 
-    retained_np = retained.cpu().detach().numpy()
-    n_clusters = min(na, retained_np.shape[0])
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10).fit(retained_np)
-    centers = kmeans.cluster_centers_
-
-    selected = []
-    for i in range(n_clusters):
-        dists = np.sum((retained_np - centers[i])**2, axis=1)
-        idx = np.argmin(dists)
-        selected.append(retained[idx])
-
-    return torch.stack(selected) if selected else retained[:na]
+    return _select_from_clusters(retained, retained_acq, na)

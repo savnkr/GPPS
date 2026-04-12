@@ -28,6 +28,20 @@ def source_term_torch(X):
     return -3 * (np.pi ** 2) * torch.sin(np.pi * X[:, 0]) * torch.sin(np.pi * X[:, 1]) * torch.sin(np.pi * X[:, 2])
 
 
+def _write_plotly_exports(fig, html_path, *, width, height, png_scale=3, pdf_scale=2):
+    """Always save HTML; best-effort static export when Chrome/Kaleido works."""
+    fig.write_html(html_path)
+    try:
+        fig.write_image(html_path.replace('.html', '.pdf'), format='pdf',
+                        width=width, height=height, scale=pdf_scale)
+        fig.write_image(html_path.replace('.html', '.png'), format='png',
+                        width=width, height=height, scale=png_scale)
+        print(f"Saved: {html_path} (+pdf, +png)")
+    except Exception as exc:
+        print(f"Saved: {html_path}")
+        print(f"Warning: static Plotly export skipped: {exc}")
+
+
 def create_row_plot(X_test_np, ground_truth, prediction, error, std_dev,
                     save_path='row_al_cluster_poisson_3d.html', title_text='3D Poisson — GP + Active Learning (Clustering)'):
     fig = make_subplots(
@@ -94,10 +108,7 @@ def create_row_plot(X_test_np, ground_truth, prediction, error, std_dev,
         margin=dict(l=10, r=10, t=40, b=10),
         title=dict(text=title_text, x=0.5, font=dict(size=18)),
     )
-    fig.write_html(save_path)
-    fig.write_image(save_path.replace('.html', '.pdf'), format='pdf', width=1600, height=400, scale=2)
-    fig.write_image(save_path.replace('.html', '.png'), format='png', width=1600, height=400, scale=3)
-    print(f"Saved: {save_path} (+pdf, +png)")
+    _write_plotly_exports(fig, save_path, width=1600, height=400)
     return fig
 
 
@@ -134,10 +145,7 @@ def create_convergence_plot(cluster_pts, cluster_errors, cluster_vars,
         margin=dict(l=60, r=20, t=50, b=50),
         title=dict(text='Active Learning Convergence — 3D Poisson', x=0.5),
     )
-    fig.write_html(save_path)
-    fig.write_image(save_path.replace('.html', '.pdf'), format='pdf', width=1000, height=400, scale=2)
-    fig.write_image(save_path.replace('.html', '.png'), format='png', width=1000, height=400, scale=3)
-    print(f"Saved: {save_path} (+pdf, +png)")
+    _write_plotly_exports(fig, save_path, width=1000, height=400)
     return fig
 
 
@@ -148,10 +156,10 @@ def run_gp_prediction(solver, Xi, Xb, f_Xi, g_Xb, X_test, actual):
 
     post_mean = solver.posterior_mean(X_test, Xi, Xb, C_inv, y_obs).detach()
     post_cov = solver.posterior_covariance(X_test, X_test.clone(), Xi, Xb, C_inv).detach()
-    post_var = torch.diag(post_cov).numpy()
+    post_var = torch.diag(post_cov).cpu().numpy()
     post_std = np.sqrt(np.clip(post_var, 1e-12, None))
 
-    pred = post_mean.numpy().reshape(-1)
+    pred = post_mean.cpu().numpy().reshape(-1)
     err = np.abs(pred - actual)
     return pred, err, post_std, post_var, C_inv, y_obs
 
@@ -239,20 +247,20 @@ def run(n_initial=20, n_final=80, n_iterations=10, n_test=500,
     # Save results
     np.savez(
         os.path.join(save_dir, 'al_comparison_results.npz'),
-        X_test=X_test.numpy(),
+        X_test=X_test.cpu().numpy(),
         ground_truth=actual,
         prediction_cluster=pred_final,
         error_cluster=err_final,
         std_cluster=std_final,
         cl_pts=cl_pts, cl_errs=cl_errs, cl_vars=cl_vars,
         nc_pts=nc_pts, nc_errs=nc_errs, nc_vars=nc_vars,
-        Xi_cluster=Xi_cl.numpy(), Xi_nocluster=Xi_nc.numpy(),
-        Xb=Xb.numpy(),
+        Xi_cluster=Xi_cl.cpu().numpy(), Xi_nocluster=Xi_nc.cpu().numpy(),
+        Xb=Xb.cpu().numpy(),
     )
 
     # Row plot (the main plot: row_al_cluster_poisson_3d)
     create_row_plot(
-        X_test.numpy(), actual, pred_final, err_final, std_final,
+        X_test.cpu().numpy(), actual, pred_final, err_final, std_final,
         save_path=os.path.join(save_dir, 'row_al_cluster_poisson_3d.html'),
     )
 

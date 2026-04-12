@@ -23,7 +23,8 @@ import matplotlib.pyplot as plt
 from src import (
     RBFKernel, PoissonOperators, GPPoissonSolver,
     generate_disc_domain, sobol_disk_sampling,
-    adaptive_sampling_poisson_sdd, train_sdd
+    adaptive_sampling_poisson_sdd, train_sdd,
+    optimize_hyperparameters_sdd
 )
 
 torch.manual_seed(100)
@@ -56,8 +57,19 @@ def build_sdd_cfg(cfg):
     }
 
 
+def format_lengthscale(value):
+    arr = np.asarray(value, dtype=float).reshape(-1)
+    if arr.size == 1:
+        return f"{arr[0]:.4f}"
+    return "[" + ", ".join(f"{v:.4f}" for v in arr) + "]"
+
+
 def sdd_posterior_stats(solver, X_test, Xi, Xb, C_full, y_obs, sdd_cfg, epochs_mean, epochs_var):
-    """Compute posterior mean and diagonal variance using SDD."""
+    """Compute posterior mean and diagonal variance using SDD.
+
+    Returns correction (k* C^-1 k*^T) separately since base_var - correction
+    suffers from catastrophic cancellation when correction ≈ base_var.
+    """
     cfg_mean = {**sdd_cfg, 'num_epochs': epochs_mean}
     A_mean = train_sdd(C_full, y_obs, **cfg_mean, verbose=False)
 
@@ -71,34 +83,49 @@ def sdd_posterior_stats(solver, X_test, Xi, Xb, C_full, y_obs, sdd_cfg, epochs_m
     correction = torch.sum(cov_vec * A_var.T, dim=1)
     pred_var = torch.clamp(base_var - correction, min=1e-10)
 
-    return pred_mean, pred_var.cpu().numpy()
+    return pred_mean, pred_var.cpu().numpy(), correction.cpu().numpy()
 
 
 def run_active_learning_sdd(solver, Xi, Xb, g_Xb, X_pool, X_test, u_ref, cfg, device,
-                            use_clustering=True):
+                            use_clustering=True, optimize_hp=False, hp_every=2):
     dtype = torch.float64
     n_per_iter = (cfg['training']['n_final'] - cfg['training']['n_initial']) // cfg['training']['n_iterations']
     sdd_cfg = build_sdd_cfg(cfg)
 
+    # Fast SDD config for hyperparameter optimization (fewer epochs)
+    hp_sdd_cfg = {**sdd_cfg, 'num_epochs': 1000}
+
     Xi_active = Xi.clone()
-    errors, variances, n_points = [], [], [Xi_active.shape[0]]
+    errors, max_errors, n_points = [], [], [Xi_active.shape[0]]
 
     for it in range(cfg['training']['n_iterations'] + 1):
         f_Xi = -torch.ones(Xi_active.shape[0], 1, dtype=dtype, device=device)
         y_obs = torch.cat((f_Xi, g_Xb), dim=0)
 
+        # Optionally optimize hyperparameters
+        if optimize_hp and it > 0 and it % hp_every == 0:
+            compute_cov = lambda: solver.compute_covariance_matrix(Xi_active, Xb)
+            ls, var = optimize_hyperparameters_sdd(
+                solver.kernel, compute_cov, y_obs, hp_sdd_cfg,
+                jitter=cfg['training']['jitter'], verbose=True,
+                observation_group_sizes=[Xi_active.shape[0], Xb.shape[0]],
+                optimize_variance=False,
+            )
+            print(f"  Updated HP: ls={format_lengthscale(ls)}, var={var:.4f}")
+
         C_full = solver.compute_covariance_matrix(Xi_active, Xb)
 
-        pred_mean, pred_var = sdd_posterior_stats(
+        pred_mean, pred_var, correction = sdd_posterior_stats(
             solver, X_test, Xi_active, Xb, C_full, y_obs, sdd_cfg,
             cfg['sdd']['epochs_mean'], cfg['sdd']['epochs_var']
         )
 
         error = np.abs(pred_mean.cpu().numpy().reshape(-1) - u_ref)
         errors.append(np.mean(error))
-        variances.append(np.mean(pred_var))
+        max_errors.append(np.max(error))
 
-        print(f"Iter {it}: Points={Xi_active.shape[0]}, MAE={errors[-1]:.6f}, Var={variances[-1]:.6f}")
+        print(f"Iter {it}: Points={Xi_active.shape[0]}, MAE={errors[-1]:.6f}, "
+              f"MaxErr={max_errors[-1]:.6f}")
 
         if it < cfg['training']['n_iterations']:
             acq_sdd_cfg = {**sdd_cfg, 'num_epochs': cfg['sdd']['epochs_var']}
@@ -117,7 +144,7 @@ def run_active_learning_sdd(solver, Xi, Xb, g_Xb, X_pool, X_test, u_ref, cfg, de
 
     pred_std = np.sqrt(np.clip(pred_var, 1e-12, None))
     return {
-        'points': n_points, 'errors': errors, 'variances': variances,
+        'points': n_points, 'errors': errors, 'max_errors': max_errors,
         'Xi_final': Xi_active, 'pred_mean': pred_mean, 'pred_std': pred_std
     }
 
@@ -189,12 +216,13 @@ def plot_results(clustered, nocluster, X_test, u_ref, Xb, output_dir):
     ax1.set_xlabel('Number of Training Points'); ax1.set_ylabel('Mean Absolute Error')
     ax1.set_title('Error Convergence'); ax1.legend(); ax1.grid(True, alpha=0.3)
 
-    ax2.plot(clustered['points'], clustered['variances'], 'o-', color='#2ca02c', linewidth=2,
+    ax2.plot(clustered['points'], clustered['max_errors'], 'o-', color='#2ca02c', linewidth=2,
              label='AL+SDD + Clustering')
-    ax2.plot(nocluster['points'], nocluster['variances'], 's--', color='#1f77b4', linewidth=2,
+    ax2.plot(nocluster['points'], nocluster['max_errors'], 's--', color='#1f77b4', linewidth=2,
              label='AL+SDD (no clustering)')
-    ax2.set_xlabel('Number of Training Points'); ax2.set_ylabel('Mean Posterior Variance')
-    ax2.set_title('Uncertainty Reduction'); ax2.legend(); ax2.grid(True, alpha=0.3)
+    ax2.set_xlabel('Number of Training Points')
+    ax2.set_ylabel('Max Absolute Error')
+    ax2.set_title('Worst-Case Error'); ax2.legend(); ax2.grid(True, alpha=0.3)
 
     plt.tight_layout()
     fig2.savefig(output_dir / 'convergence_poisson_2d_sdd.pdf', format='pdf', bbox_inches='tight')
@@ -211,16 +239,16 @@ def save_results(results, X_test, u_ref, output_dir):
         output_dir / 'results_al_sdd.npz',
         clustered_points=results['clustered']['points'],
         clustered_errors=results['clustered']['errors'],
-        clustered_variances=results['clustered']['variances'],
+        clustered_max_errors=results['clustered']['max_errors'],
         clustered_Xi=results['clustered']['Xi_final'].cpu().numpy(),
         clustered_pred=results['clustered']['pred_mean'].cpu().numpy(),
-        clustered_var=results['clustered']['pred_std']**2,
+        clustered_std=results['clustered']['pred_std'],
         nocluster_points=results['nocluster']['points'],
         nocluster_errors=results['nocluster']['errors'],
-        nocluster_variances=results['nocluster']['variances'],
+        nocluster_max_errors=results['nocluster']['max_errors'],
         nocluster_Xi=results['nocluster']['Xi_final'].cpu().numpy(),
         nocluster_pred=results['nocluster']['pred_mean'].cpu().numpy(),
-        nocluster_var=results['nocluster']['pred_std']**2,
+        nocluster_std=results['nocluster']['pred_std'],
         X_test=X_test.cpu().numpy(),
         u_ref=u_ref
     )
@@ -228,6 +256,14 @@ def save_results(results, X_test, u_ref, output_dir):
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--optimize-hp', action='store_true',
+                        help='Enable SDD-based kernel hyperparameter optimization during AL')
+    parser.add_argument('--hp-every', type=int, default=2,
+                        help='Optimize hyperparameters every N AL iterations (default: 2)')
+    args = parser.parse_args()
+
     config_path = ROOT_DIR / 'configs' / 'config.yaml'
     cfg = load_config(config_path)
     device = setup_device()
@@ -235,6 +271,8 @@ def main():
 
     print(f"Using device: {device}")
     print("Inference method: Stochastic Dual Descent (SDD)")
+    if args.optimize_hp:
+        print(f"Hyperparameter optimization: ON (every {args.hp_every} iterations)")
 
     theta_b = torch.linspace(0, 2 * torch.pi, cfg['training']['n_boundary'] + 1)[:-1]
     Xb = torch.stack([torch.cos(theta_b), torch.sin(theta_b)], dim=1).to(dtype).to(device)
@@ -258,22 +296,28 @@ def main():
     solver = GPPoissonSolver(kernel, operators)
 
     print("\n=== AL + SDD WITH Clustering ===")
+    # Reset kernel to initial values for fair comparison
+    kernel.set_lengthscale(cfg['kernel']['lengthscale'])
+    kernel.set_variance(cfg['kernel']['variance'])
     clustered_results = run_active_learning_sdd(
         solver, Xi_initial.clone(), Xb, g_Xb, X_pool, X_test, u_ref, cfg, device,
-        use_clustering=True
+        use_clustering=True, optimize_hp=args.optimize_hp, hp_every=args.hp_every
     )
 
     print("\n=== AL + SDD WITHOUT Clustering ===")
+    # Reset kernel to initial values for fair comparison
+    kernel.set_lengthscale(cfg['kernel']['lengthscale'])
+    kernel.set_variance(cfg['kernel']['variance'])
     nocluster_results = run_active_learning_sdd(
         solver, Xi_initial.clone(), Xb, g_Xb, X_pool, X_test, u_ref, cfg, device,
-        use_clustering=False
+        use_clustering=False, optimize_hp=args.optimize_hp, hp_every=args.hp_every
     )
 
     print("\n=== Results Summary ===")
     print(f"AL+SDD + Clustering:    MAE={clustered_results['errors'][-1]:.6f}, "
-          f"Var={clustered_results['variances'][-1]:.6f}")
+          f"MaxErr={clustered_results['max_errors'][-1]:.6f}")
     print(f"AL+SDD no Clustering:   MAE={nocluster_results['errors'][-1]:.6f}, "
-          f"Var={nocluster_results['variances'][-1]:.6f}")
+          f"MaxErr={nocluster_results['max_errors'][-1]:.6f}")
 
     if nocluster_results['errors'][-1] > 0:
         improvement = 100 * (nocluster_results['errors'][-1] - clustered_results['errors'][-1]) / \

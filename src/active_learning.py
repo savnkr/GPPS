@@ -9,12 +9,7 @@ def ucb_acquisition(mean, variance, kappa=2.0):
 
 
 def _select_from_clusters(retained, retained_acq_values, na):
-    """Select the highest-acquisition-value point from each KMeans cluster.
-
-    Instead of picking the point closest to the cluster center (which ignores
-    acquisition values), pick the best point *within* each cluster. This gives
-    spatial diversity from clustering while respecting the acquisition function.
-    """
+    """Select the top-acquisition point from each KMeans cluster."""
     retained_np = retained.cpu().detach().numpy()
     n_clusters = min(na, retained_np.shape[0])
 
@@ -72,10 +67,7 @@ def adaptive_sampling(solver, X_pool, X_train, Xd, Xn, y_train, na=5, kappa=2.0,
 def adaptive_sampling_sdd(solver, X_pool, X_train, Xd, Xn, y_train, C_full, sdd_cfg,
                           na=5, kappa=2.0, exclusion_radius=0.05,
                           acquisition_function="variance", ar_ratio=0.3):
-    """
-    SDD-based adaptive sampling for PDEs with mixed boundary conditions (e.g. heat equation).
-    Uses Stochastic Dual Descent instead of exact matrix inversion for scalability.
-    """
+    """Run SDD-based adaptive sampling for mixed-boundary PDEs."""
     from .sdd import train_sdd
 
     X_pool_filtered = filter_candidates(X_pool, X_train, exclusion_radius)
@@ -165,10 +157,7 @@ def adaptive_sampling_poisson_sdd(solver, X_pool, X_train, Xb, y_train, C_full, 
                                   na=5, kappa=2.0, exclusion_radius=0.05,
                                   acquisition_function="variance", ar_ratio=0.3,
                                   use_clustering=True):
-    """
-    SDD-based adaptive sampling for Poisson equation with Dirichlet BCs.
-    Uses Stochastic Dual Descent instead of exact matrix inversion for scalability.
-    """
+    """Run SDD-based adaptive sampling for Poisson problems."""
     from .sdd import train_sdd
 
     X_pool_filtered = filter_candidates(X_pool, X_train, exclusion_radius)

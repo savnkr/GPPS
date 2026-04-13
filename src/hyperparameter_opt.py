@@ -1,33 +1,4 @@
-"""
-Optional SDD-based kernel hyperparameter optimization.
-
-For GP-PDE observations y = T u with linear operator/boundary functionals T,
-the exact model evidence p(y | theta) is mathematically well-defined.
-
-This module uses a solver-aware hybrid criterion:
-
-- Exact GP marginal likelihood when the observation system is small enough.
-- Balanced holdout predictive NLL across observation blocks when block sizes
-  are provided.
-- SDD residual checks so candidates that the deployed SDD budget cannot solve
-  accurately are rejected.
-
-For larger systems it can still fall back to the original approximate NLL:
-
-    NLL ≈ 0.5 * y^T SDD(K, y) + 0.5 * SLQ_logdet(K) + const
-
-- Data-fit term uses SDD to approximate K^{-1}y without O(N^3) inversion.
-- Log-determinant uses Stochastic Lanczos Quadrature (SLQ), which only
-  needs O(N^2) matrix-vector products.
-- Optimization uses conservative local grid search around the current kernel.
-
-Usage:
-    from src.hyperparameter_opt import optimize_hyperparameters_sdd
-
-    # Inside AL loop:
-    compute_cov = lambda: solver.compute_covariance_matrix(Xi, Xb)
-    optimize_hyperparameters_sdd(kernel, compute_cov, y_obs, sdd_cfg)
-"""
+"""Solver-aware kernel hyperparameter tuning for SDD-based GP PDE models."""
 import math
 from contextlib import contextmanager, nullcontext
 import numpy as np
@@ -66,7 +37,7 @@ def _torch_seed_context(seed, device):
 
 
 def _balanced_validation_splits(group_sizes, n_splits=3, val_fraction=0.2, seed=0):
-    """Create balanced holdout splits that preserve PDE/boundary observation types."""
+    """Create balanced holdout splits across observation groups."""
     if group_sizes is None:
         return []
 
@@ -108,7 +79,7 @@ def _balanced_validation_splits(group_sizes, n_splits=3, val_fraction=0.2, seed=
 
 @torch.no_grad()
 def exact_log_marginal_likelihood(K, y, jitter=1e-6):
-    """Exact GP log marginal likelihood for linear GP observations."""
+    """Return the exact GP negative log marginal likelihood."""
     N, du = K.shape[0], y.shape[1]
     K_reg = K + jitter * _eye_like(K)
     L = torch.linalg.cholesky(K_reg)
@@ -123,7 +94,7 @@ def exact_log_marginal_likelihood(K, y, jitter=1e-6):
 
 @torch.no_grad()
 def heldout_predictive_nll(K, y, train_idx, val_idx, jitter=1e-6):
-    """Predictive NLL on a holdout subset of operator observations."""
+    """Return predictive NLL on a held-out observation subset."""
     du = y.shape[1]
     K_reg = K + jitter * _eye_like(K)
 
@@ -155,7 +126,7 @@ def heldout_predictive_nll(K, y, train_idx, val_idx, jitter=1e-6):
 
 @torch.no_grad()
 def sdd_relative_residual(K, y, sdd_cfg, jitter=1e-6, seed=None):
-    """Residual that the deployed SDD solver achieves for this kernel setting."""
+    """Return the relative residual achieved by SDD on this system."""
     with _torch_seed_context(seed, K.device):
         alpha = train_sdd(K, y, **sdd_cfg, verbose=False)
     K_reg = K + jitter * _eye_like(K)
@@ -185,19 +156,7 @@ def _format_lengthscale(values):
 
 @torch.no_grad()
 def stochastic_log_det(K, n_probes=10, n_lanczos=30, seed=None):
-    """Estimate log|K| using Stochastic Lanczos Quadrature (SLQ).
-
-    Approximates tr(log(K)) = log|K| using random probe vectors and
-    Lanczos tridiagonalization. Only requires matrix-vector products.
-
-    Args:
-        K: Symmetric positive-definite matrix [N, N]
-        n_probes: Number of random probe vectors (more = lower variance)
-        n_lanczos: Number of Lanczos iterations (more = better approximation)
-
-    Returns:
-        Scalar estimate of log|K|
-    """
+    """Estimate ``log|K|`` with stochastic Lanczos quadrature."""
     N = K.shape[0]
     dtype, device = K.dtype, K.device
     estimates = []
@@ -267,21 +226,7 @@ def stochastic_log_det(K, n_probes=10, n_lanczos=30, seed=None):
 @torch.no_grad()
 def sdd_approximate_nll(K, y, sdd_cfg, jitter=1e-6,
                         n_probes=20, n_lanczos=30, seed=None):
-    """Compute approximate negative log marginal likelihood using SDD + SLQ.
-
-    NLL = 0.5 * y^T K^{-1} y + 0.5 * log|K| + 0.5 * N * log(2*pi)
-
-    Args:
-        K: Covariance matrix [N, N] (before jitter)
-        y: Observations [N, du]
-        sdd_cfg: Dict for train_sdd (batch_size, beta, rho, num_epochs)
-        jitter: Diagonal regularization
-        n_probes: SLQ probe vectors (20+ recommended for stable estimates)
-        n_lanczos: SLQ Lanczos iterations
-
-    Returns:
-        Scalar NLL estimate
-    """
+    """Approximate the GP negative log marginal likelihood with SDD and SLQ."""
     N = K.shape[0]
     dtype, device = K.dtype, K.device
     K_reg = K + jitter * torch.eye(N, dtype=dtype, device=device)
@@ -315,45 +260,7 @@ def optimize_hyperparameters_sdd(kernel, compute_cov_matrix, y_train, sdd_cfg,
                                  optimize_variance=True,
                                  variance_search_range=1.10,
                                  coordinate_passes=2):
-    """Optimize kernel hyperparameters with a solver-aware evidence criterion.
-
-    For moderate system sizes this uses exact GP marginal likelihood and
-    balanced holdout predictive NLL. For larger systems it falls back to
-    the original SDD + SLQ approximate NLL. In all cases it rejects kernel
-    settings that SDD cannot solve accurately enough under the provided
-    iteration budget.
-
-    Args:
-        kernel: RBFKernel instance (modified in-place)
-        compute_cov_matrix: Callable returning the GP-PDE covariance matrix
-                           using current kernel state. Example:
-                           lambda: solver.compute_covariance_matrix(Xi, Xb)
-        y_train: Observation vector [N, du]
-        sdd_cfg: Dict for train_sdd. Use moderate epochs, e.g.:
-                 {'batch_size': 20, 'beta': 'auto', 'rho': 0.9, 'num_epochs': 1000}
-        jitter: Diagonal regularization
-        n_probes: SLQ probe count per NLL evaluation (20+ for stability)
-        n_lanczos: SLQ Lanczos iterations
-        n_grid: Number of grid points per coordinate search.
-        n_repeats: NLL evaluations per candidate (averaged to reduce noise)
-        search_range: Multiplicative trust region around current values.
-        verbose: Print progress
-        observation_group_sizes: Optional list of block sizes in y_train
-            (e.g. [n_interior, n_boundary] or [n_interior, n_dirichlet, n_neumann]).
-            When provided, candidates are ranked by balanced holdout predictive NLL.
-        validation_fraction: Holdout fraction per observation block.
-        validation_splits: Number of balanced holdout splits to average.
-        random_seed: Seed for holdout split generation.
-        exact_threshold: Use exact Cholesky marginal likelihood when N <= this.
-        max_sdd_rel_residual: Absolute residual floor for well-conditioned solves.
-        max_residual_growth: Relative residual budget against the current kernel.
-        optimize_variance: Whether to include variance updates.
-        variance_search_range: Smaller trust region used for variance updates.
-        coordinate_passes: Number of alternating coordinate-descent passes.
-
-    Returns:
-        (best_lengthscale, best_variance) tuple
-    """
+    """Tune kernel hyperparameters with a solver-aware search."""
     init_ls = _parameter_to_numpy(kernel.lengthscale)
     init_var = float(_parameter_to_numpy(kernel.variance)[0])
     N = y_train.shape[0]

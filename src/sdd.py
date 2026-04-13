@@ -8,35 +8,7 @@ def train_sdd(C, y, batch_size=20, beta='auto', rho=0.9,
               precondition=True, burn_in_frac=0.5,
               epoch_scaling='auto',
               verbose=False, print_every=500):
-    """
-    Stochastic Dual Descent to approximate C^{-1}y without explicit matrix inversion.
-
-    Solves the dual objective:  min_alpha  (1/2) alpha^T K alpha - y^T alpha
-    using mini-batch SGD with heavy-ball momentum, Jacobi preconditioning,
-    and Polyak-Ruppert tail averaging.
-
-    Reference: "Stochastic Gradient Descent for Gaussian Processes Done Right"
-               Jihao Andreas Lin, Javier Antoran, Jose Miguel Hernandez-Lobato (2023).
-
-    Args:
-        C: Covariance matrix [N, N]
-        y: Target vector/matrix [N, du]
-        batch_size: Mini-batch size B for stochastic gradient estimates
-        beta: Step size (learning rate). Use 'auto' to set adaptively.
-        rho: Heavy-ball momentum parameter (default 0.9)
-        num_epochs: Base number of optimization iterations (scaled if epoch_scaling='auto')
-        jitter: Regularization added to diagonal of C for numerical stability
-        precondition: Use Jacobi (diagonal) preconditioning to improve conditioning
-        burn_in_frac: Fraction of epochs to discard before tail averaging (default 0.5)
-        epoch_scaling: 'auto' scales epochs as num_epochs * N/B * log(N)/log(B)
-                       to maintain convergence quality as N grows.
-                       'none' uses num_epochs directly.
-        verbose: Whether to print convergence progress
-        print_every: Frequency of progress printing (in iterations)
-
-    Returns:
-        A_bar: Approximation of C^{-1}y, shape [N, du]
-    """
+    """Approximate ``C^{-1} y`` with stochastic dual descent."""
     N = C.shape[0]
     du = y.shape[1]
     dtype = C.dtype
